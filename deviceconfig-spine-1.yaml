@@ -1,0 +1,13 @@
+apiVersion: netops.example.com/v1alpha1
+kind: DeviceConfig
+metadata:
+  name: spine-1-config
+spec:
+  deviceRef:
+    name: spine-1
+  intent:
+    hostname: spine-1
+    bgp:
+      asn: 65001
+    vxlan:
+      enabled: true
