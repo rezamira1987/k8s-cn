@@ -1,15 +1,13 @@
-"""
-DeviceConfig Controller - Step 13.4
-Reconcile:
-- Read DeviceConfig.spec
-- Resolve referenced NetworkDevice
-- Write status based on whether NetworkDevice exists
-
-No device actions yet.
-"""
-
 from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
+
+from adapters.base import (
+    DeviceEndpoint,
+    DevicePlatform,
+    DeviceCredentialsRef,
+    NetworkDeviceSpec,
+)
+from adapters.dummy import DummyAdapter
 
 GROUP = "netops.example.com"
 VERSION = "v1alpha1"
@@ -24,9 +22,7 @@ def load_kube():
         config.load_incluster_config()
 
 
-def get_network_device(
-    api: client.CustomObjectsApi, namespace: str, name: str
-) -> dict | None:
+def get_network_device(api, namespace, name):
     try:
         return api.get_namespaced_custom_object(
             group=GROUP,
@@ -41,12 +37,7 @@ def get_network_device(
         raise
 
 
-def patch_deviceconfig_status(
-    api: client.CustomObjectsApi,
-    namespace: str,
-    name: str,
-    status: dict,
-) -> None:
+def patch_status(api, namespace, name, status):
     api.patch_namespaced_custom_object_status(
         group=GROUP,
         version=VERSION,
@@ -57,70 +48,95 @@ def patch_deviceconfig_status(
     )
 
 
-def reconcile(api: client.CustomObjectsApi, obj: dict) -> None:
-    meta = obj.get("metadata", {})
-    spec = obj.get("spec", {})
+def build_device_spec(nd_obj):
+    spec = nd_obj.get("spec", {})
+    endpoint = spec.get("endpoint", {})
+    platform = spec.get("platform", {})
+
+    return NetworkDeviceSpec(
+        name=nd_obj["metadata"]["name"],
+        namespace=nd_obj["metadata"].get("namespace", "default"),
+        endpoint=DeviceEndpoint(
+            address=endpoint["address"],
+            port=endpoint.get("port", 830),
+        ),
+        platform=DevicePlatform(
+            vendor=platform.get("vendor"),
+            os=platform.get("os"),
+            model=platform.get("model"),
+        ),
+        transport=spec.get("transport", "netconf"),
+        credentials_ref=(
+            DeviceCredentialsRef(**spec["credentialsRef"])
+            if "credentialsRef" in spec
+            else None
+        ),
+        role=spec.get("role"),
+    )
+
+
+def reconcile(api, adapter, obj):
+    meta = obj["metadata"]
+    spec = obj["spec"]
 
     name = meta["name"]
     namespace = meta.get("namespace", "default")
     generation = meta.get("generation", 0)
 
-    device_ref = spec.get("deviceRef", {}) or {}
-    device_name = device_ref.get("name")
-    dry_run = spec.get("dryRun", False)
+    device_name = spec.get("deviceRef", {}).get("name")
     intent = spec.get("intent", {}) or {}
+    dry_run = spec.get("dryRun", False)
 
-    base_status = {
-        "observedGeneration": generation,
-    }
+    base = {"observedGeneration": generation}
 
     if not device_name:
-        status = {
-            **base_status,
+        patch_status(api, namespace, name, {
+            **base,
             "phase": "error",
-            "message": "deviceRef.name is required",
-            "lastError": {"code": "MissingDeviceRef", "detail": "spec.deviceRef.name is empty"},
-        }
-        patch_deviceconfig_status(api, namespace, name, status)
-        print(f"[RECONCILED] {namespace}/{name} -> error (missing deviceRef.name)")
+            "message": "deviceRef.name missing",
+        })
         return
 
     nd = get_network_device(api, namespace, device_name)
-
     if nd is None:
-        status = {
-            **base_status,
+        patch_status(api, namespace, name, {
+            **base,
             "phase": "error",
-            "message": f"referenced NetworkDevice '{device_name}' not found",
-            "lastError": {"code": "NetworkDeviceNotFound", "detail": device_name},
-        }
-        patch_deviceconfig_status(api, namespace, name, status)
-        print(f"[RECONCILED] {namespace}/{name} -> error (NetworkDevice not found: {device_name})")
+            "message": f"NetworkDevice '{device_name}' not found",
+        })
         return
 
-    nd_spec = nd.get("spec", {}) or {}
-    endpoint = (nd_spec.get("endpoint") or {}).get("address")
-    vendor = (nd_spec.get("platform") or {}).get("vendor")
-    osname = (nd_spec.get("platform") or {}).get("os")
+    device = build_device_spec(nd)
 
-    status = {
-        **base_status,
-        "phase": "pending",
-        "message": (
-            f"resolved device={device_name} vendor={vendor} os={osname} "
-            f"endpoint={endpoint} dryRun={dry_run} intentKeys={sorted(intent.keys())}"
-        ),
-    }
-    patch_deviceconfig_status(api, namespace, name, status)
-    print(f"[RECONCILED] {namespace}/{name} -> pending (resolved NetworkDevice={device_name})")
+    # 1) validate
+    v = adapter.validate_intent(intent)
+    if not v.ok:
+        patch_status(api, namespace, name, {
+            **base,
+            "phase": "error",
+            "message": v.detail,
+        })
+        return
+
+    # 2) apply (dummy)
+    r = adapter.apply_intent(device, intent, dry_run=dry_run)
+
+    patch_status(api, namespace, name, {
+        **base,
+        "phase": "applied" if r.ok else "error",
+        "message": r.detail,
+        "changed": r.changed,
+        "facts": r.facts,
+    })
 
 
 def main():
     load_kube()
     api = client.CustomObjectsApi()
+    adapter = DummyAdapter()
     w = watch.Watch()
 
-    print("Watching DeviceConfig objects (resolve deviceRef)...")
+    print("Watching DeviceConfig objects (with DummyAdapter)...")
 
     for event in w.stream(
         api.list_cluster_custom_object,
@@ -128,15 +144,9 @@ def main():
         version=VERSION,
         plural=DEVICECONFIGS,
     ):
-        event_type = event["type"]
-        obj = event["object"]
-
-        if event_type == "DELETED":
-            meta = obj.get("metadata", {})
-            print(f"[DELETED] {meta.get('namespace','default')}/{meta.get('name')}")
+        if event["type"] == "DELETED":
             continue
-
-        reconcile(api, obj)
+        reconcile(api, adapter, event["object"])
 
 
 if __name__ == "__main__":
