@@ -1,0 +1,15 @@
+apiVersion: netops.example.com/v1alpha1
+kind: NetworkDevice
+metadata:
+  name: csrv-2
+spec:
+  endpoint:
+    address: 212.132.91.115
+    port: 830
+  platform:
+    vendor: cisco
+    os: ios-xe
+  role: router
+  transport: netconf
+  credentialsRef:
+    name: csrv-2-creds

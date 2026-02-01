@@ -1,0 +1,16 @@
+apiVersion: netops.example.com/v1alpha1
+kind: DeviceConfig
+metadata:
+  name: csrv-2-config
+spec:
+  deviceRef:
+    name: csrv-2
+  dryRun: false
+  intent:
+    hostname: csrv-2
+    interfaces:
+      Loopback0:
+        ip: 2.2.2.2/32
+    routing:
+      bgp:
+        asn: 65001
