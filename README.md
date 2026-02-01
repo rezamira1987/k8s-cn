@@ -13,6 +13,7 @@ A learning project to build a Kubernetes-based control plane for network devices
   - Represents desired configuration intent for a device
   - Similar concept to Deployment/ConfigMap
 
+
 ### Current Controller
 - A Python-based controller that:
   - Watches `DeviceConfig` objects
@@ -24,10 +25,12 @@ A learning project to build a Kubernetes-based control plane for network devices
 > This stage focuses purely on Kubernetes control-plane mechanics.
 
 ## Repository Structure
+.
 ├── crds/ # CRD definitions (API schema)
 ├── controllers/ # Python controllers (reconcile logic)
 ├── requirements.txt
 ├── README.md
+
 ## Status Model
 The controller currently updates:
 - `status.phase`

@@ -1,6 +1,11 @@
 """
-DeviceConfig Controller - Step 13.3
-Reconcile: read spec, write status (no device actions yet)
+DeviceConfig Controller - Step 13.4
+Reconcile:
+- Read DeviceConfig.spec
+- Resolve referenced NetworkDevice
+- Write status based on whether NetworkDevice exists
+
+No device actions yet.
 """
 
 from kubernetes import client, config, watch
@@ -8,7 +13,8 @@ from kubernetes.client.rest import ApiException
 
 GROUP = "netops.example.com"
 VERSION = "v1alpha1"
-PLURAL = "deviceconfigs"
+DEVICECONFIGS = "deviceconfigs"
+NETWORKDEVICES = "networkdevices"
 
 
 def load_kube():
@@ -16,6 +22,39 @@ def load_kube():
         config.load_kube_config()
     except Exception:
         config.load_incluster_config()
+
+
+def get_network_device(
+    api: client.CustomObjectsApi, namespace: str, name: str
+) -> dict | None:
+    try:
+        return api.get_namespaced_custom_object(
+            group=GROUP,
+            version=VERSION,
+            namespace=namespace,
+            plural=NETWORKDEVICES,
+            name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+
+
+def patch_deviceconfig_status(
+    api: client.CustomObjectsApi,
+    namespace: str,
+    name: str,
+    status: dict,
+) -> None:
+    api.patch_namespaced_custom_object_status(
+        group=GROUP,
+        version=VERSION,
+        namespace=namespace,
+        plural=DEVICECONFIGS,
+        name=name,
+        body={"status": status},
+    )
 
 
 def reconcile(api: client.CustomObjectsApi, obj: dict) -> None:
@@ -26,51 +65,72 @@ def reconcile(api: client.CustomObjectsApi, obj: dict) -> None:
     namespace = meta.get("namespace", "default")
     generation = meta.get("generation", 0)
 
-    device_ref = spec.get("deviceRef", {})
-    intent = spec.get("intent", {})
+    device_ref = spec.get("deviceRef", {}) or {}
+    device_name = device_ref.get("name")
     dry_run = spec.get("dryRun", False)
+    intent = spec.get("intent", {}) or {}
 
-    # For now: just reflect that we observed it and stored a friendly summary
-    status = {
+    base_status = {
         "observedGeneration": generation,
-        "phase": "pending",
-        "message": f"observed deviceRef={device_ref.get('name')} dryRun={dry_run} intentKeys={sorted(intent.keys())}",
     }
 
-    body = {"status": status}
+    if not device_name:
+        status = {
+            **base_status,
+            "phase": "error",
+            "message": "deviceRef.name is required",
+            "lastError": {"code": "MissingDeviceRef", "detail": "spec.deviceRef.name is empty"},
+        }
+        patch_deviceconfig_status(api, namespace, name, status)
+        print(f"[RECONCILED] {namespace}/{name} -> error (missing deviceRef.name)")
+        return
 
-    try:
-        api.patch_namespaced_custom_object_status(
-            group=GROUP,
-            version=VERSION,
-            namespace=namespace,
-            plural=PLURAL,
-            name=name,
-            body=body,
-        )
-        print(f"[RECONCILED] {namespace}/{name} -> phase=pending")
-    except ApiException as e:
-        print(f"[ERROR] failed to patch status for {namespace}/{name}: {e.status} {e.reason}")
+    nd = get_network_device(api, namespace, device_name)
+
+    if nd is None:
+        status = {
+            **base_status,
+            "phase": "error",
+            "message": f"referenced NetworkDevice '{device_name}' not found",
+            "lastError": {"code": "NetworkDeviceNotFound", "detail": device_name},
+        }
+        patch_deviceconfig_status(api, namespace, name, status)
+        print(f"[RECONCILED] {namespace}/{name} -> error (NetworkDevice not found: {device_name})")
+        return
+
+    nd_spec = nd.get("spec", {}) or {}
+    endpoint = (nd_spec.get("endpoint") or {}).get("address")
+    vendor = (nd_spec.get("platform") or {}).get("vendor")
+    osname = (nd_spec.get("platform") or {}).get("os")
+
+    status = {
+        **base_status,
+        "phase": "pending",
+        "message": (
+            f"resolved device={device_name} vendor={vendor} os={osname} "
+            f"endpoint={endpoint} dryRun={dry_run} intentKeys={sorted(intent.keys())}"
+        ),
+    }
+    patch_deviceconfig_status(api, namespace, name, status)
+    print(f"[RECONCILED] {namespace}/{name} -> pending (resolved NetworkDevice={device_name})")
 
 
 def main():
     load_kube()
-
     api = client.CustomObjectsApi()
     w = watch.Watch()
 
-    print("Watching DeviceConfig objects (with reconcile)...")
+    print("Watching DeviceConfig objects (resolve deviceRef)...")
 
     for event in w.stream(
         api.list_cluster_custom_object,
         group=GROUP,
         version=VERSION,
-        plural=PLURAL,
+        plural=DEVICECONFIGS,
     ):
         event_type = event["type"]
         obj = event["object"]
 
-        # Ignore deletes for now
         if event_type == "DELETED":
             meta = obj.get("metadata", {})
             print(f"[DELETED] {meta.get('namespace','default')}/{meta.get('name')}")
